@@ -173,6 +173,55 @@ func (rrc *clientHelloRecordingConn) Read(b []byte) (int, error) {
 	return rrc.activeReader.Read(b)
 }
 
+// This function concatenates TLS record fragments into a single record.
+// The output is the concatenation of the payloads of the input records plus a header.
+// The input data is expected to be one or multiple TLS records, each with the following format:
+//   - 1 byte: content type
+//   - 2 bytes: protocol version
+//   - 2 bytes: length of the payload
+//   - N bytes: payload
+func concatenateTlsRecordsFragments(data []byte) ([]byte, error) {
+	const headerLength = 5
+
+	if len(data) < headerLength {
+		return nil, fmt.Errorf("input data is too short to contain even one TLS record header")
+	}
+
+	totalPayload := []byte{}
+	var contentType byte
+	var protocolVersion [2]byte
+
+	for i := 0; i < len(data); {
+		if len(data[i:]) < headerLength {
+			return nil, fmt.Errorf("incomplete TLS record header at position %d", i)
+		}
+
+		header := data[i : i+headerLength]
+		contentType = header[0]
+		protocolVersion = [2]byte{header[1], header[2]}
+		length := int(header[3])<<8 | int(header[4])
+
+		if len(data[i+headerLength:]) < length {
+			return nil, fmt.Errorf("incomplete TLS record payload at position %d", i+headerLength)
+		}
+
+		payload := data[i+headerLength : i+headerLength+length]
+		totalPayload = append(totalPayload, payload...)
+
+		i += headerLength + length
+	}
+
+	// Construct the new single TLS record
+	totalLength := len(totalPayload)
+	if totalLength > 0xFFFF {
+		return nil, fmt.Errorf("concatenated payload length %d exceeds maximum TLS record size", totalLength)
+	}
+
+	header := []byte{contentType, protocolVersion[0], protocolVersion[1], byte(totalLength >> 8), byte(totalLength & 0xFF)}
+	result := append(header, totalPayload...)
+	return result, nil
+}
+
 func (rrc *clientHelloRecordingConn) processHello(info *tls.ClientHelloInfo) (*tls.Config, error) {
 	// The hello is read at this point, so switch to no longer write incoming data to a second buffer.
 	rrc.helloMutex.Lock()
@@ -183,7 +232,12 @@ func (rrc *clientHelloRecordingConn) processHello(info *tls.ClientHelloInfo) (*t
 		bufferPool.Put(rrc.dataRead)
 	}()
 
-	hello := rrc.dataRead.Bytes()[5:]
+	concatenatedRecords, err := concatenateTlsRecordsFragments(rrc.dataRead.Bytes())
+	if err != nil {
+		return rrc.helloError("malformed ClientHello: " + err.Error())
+	}
+
+	hello := concatenatedRecords[5:]
 	// We use uTLS here purely because it exposes more TLS handshake internals, allowing
 	// us to decrypt the ClientHello and session tickets, for example. We use those functions
 	// separately without switching to uTLS entirely to allow continued upgrading of the TLS stack
